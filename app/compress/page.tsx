@@ -17,13 +17,12 @@ interface PDFFile extends File {
   progress?: number
   compressed?: boolean
   compressedSize?: number
+  id?: string
 }
 
 export default function CompressPage() {
   const [files, setFiles] = useState<PDFFile[]>([])
   const [targetSize, setTargetSize] = useState(1)
-  const [currentPage, setCurrentPage] = useState(1)
-  const [numPages, setNumPages] = useState(null)
   const [isProtected, setIsProtected] = useState(false)
   const [password, setPassword] = useState("")
   const [preserveMetadata, setPreserveMetadata] = useState(true)
@@ -68,33 +67,89 @@ export default function CompressPage() {
 
   const compressFiles = async () => {
     setCompressing(true)
-    // Simulate compression
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      for (let progress = 0; progress <= 100; progress += 10) {
-        setFiles((prev) => {
-          const newFiles = [...prev]
-          newFiles[i] = { ...file, progress }
-          return newFiles
-        })
-        await new Promise((resolve) => setTimeout(resolve, 200))
+    try {
+      const formData = new FormData()
+      files.forEach((file) => formData.append("files", file))
+      formData.append("targetSize", targetSize.toString())
+      formData.append("password", password)
+      formData.append("preserveMetadata", preserveMetadata.toString())
+
+      const response = await fetch("/api/compress", {
+        method: "POST",
+        body: formData,
+      })
+
+      if (!response.ok) {
+        throw new Error("Compression failed")
       }
-      setFiles((prev) => {
-        const newFiles = [...prev]
-        newFiles[i] = {
+
+      const result = await response.json()
+      setFiles((prev) =>
+        prev.map((file, index) => ({
           ...file,
           compressed: true,
-          compressedSize: file.size * 0.6,
-        }
-        return newFiles
-      })
+          compressedSize: result.files[index].compressedSize,
+          id: result.files[index].id,
+        })),
+      )
+      toast.success("Compression complete!")
+    } catch (error) {
+      console.error("Compression error:", error)
+      toast.error("Failed to compress files")
+    } finally {
+      setCompressing(false)
     }
-    setCompressing(false)
-    toast.success("Compression complete!")
   }
 
-  const downloadAll = () => {
-    toast.success("Downloading all files as ZIP")
+  const downloadFile = async (file: PDFFile) => {
+    try {
+      const response = await fetch(`/api/download/${file.id}`)
+      if (!response.ok) {
+        throw new Error("Download failed")
+      }
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.style.display = "none"
+      a.href = url
+      a.download = file.name
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      setFiles((prev) => prev.filter((f) => f.id !== file.id))
+    } catch (error) {
+      console.error("Download error:", error)
+      toast.error("Failed to download file")
+    }
+  }
+
+  const downloadAll = async () => {
+    try {
+      const fileIds = files.filter((f) => f.compressed).map((f) => f.id)
+      const response = await fetch("/api/download", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ fileIds }),
+      })
+      if (!response.ok) {
+        throw new Error("Download failed")
+      }
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.style.display = "none"
+      a.href = url
+      a.download = "compressed_pdfs.zip"
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      setFiles([])
+    } catch (error) {
+      console.error("Download error:", error)
+      toast.error("Failed to download files")
+    }
   }
 
   return (
@@ -183,7 +238,7 @@ export default function CompressPage() {
                 <CardContent>
                   {file.compressed ? (
                     <div className="flex justify-center space-x-2">
-                      <Button size="sm">
+                      <Button size="sm" onClick={() => downloadFile(file)}>
                         <Download className="w-4 h-4 mr-2" />
                         Download
                       </Button>

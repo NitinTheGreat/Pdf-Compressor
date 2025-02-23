@@ -1,27 +1,69 @@
 import type { NextRequest } from "next/server"
 import { PDFDocument } from "pdf-lib"
-import JSZip from "jszip"
+import sharp from "sharp"
+import { writeFile } from "fs/promises"
+import { join } from "path"
+import { connectDB, File } from "@/lib/db"
+import { Ratelimit } from "@upstash/ratelimit"
+import { Redis } from "@upstash/redis"
 
-export const maxDuration = 300 // 5 minutes max duration
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_URL!,
+  token: process.env.UPSTASH_REDIS_TOKEN!,
+})
+
+const ratelimit = new Ratelimit({
+  redis,
+  limiter: Ratelimit.slidingWindow(10, "1 m"), // 10 requests per minute
+})
+
+export const maxDuration = 300 // 5 minutes
 export const dynamic = "force-dynamic"
 
 export async function POST(req: NextRequest) {
-  const formData = await req.formData()
-  const files = formData.getAll("files") as File[]
-  const targetSize = Number(formData.get("targetSize")) * 1024 * 1024 // Convert to bytes
-  const password = formData.get("password") as string
-  const preserveMetadata = formData.get("preserveMetadata") === "true"
-  const asZip = formData.get("asZip") === "true"
-
   try {
-    const compressedFiles: { name: string; data: Uint8Array }[] = []
+    // Rate limiting
+    const ip = req.headers.get("x-forwarded-for") ?? "127.0.0.1"
+    const { success } = await ratelimit.limit(ip)
+
+    if (!success) {
+      return Response.json({ error: "Too many requests" }, { status: 429 })
+    }
+
+    await connectDB()
+
+    const formData = await req.formData()
+    const files = formData.getAll("files") as File[]
+    const targetSize = Number(formData.get("targetSize")) * 1024 * 1024 // Convert to bytes
+    const password = formData.get("password") as string
+    const preserveMetadata = formData.get("preserveMetadata") === "true"
+
+    const compressedFiles = []
 
     for (const file of files) {
       const arrayBuffer = await file.arrayBuffer()
       const pdfDoc = await PDFDocument.load(arrayBuffer)
 
+      // Get all pages
+      const pages = pdfDoc.getPages()
+
+      // Compress each page's images
+      for (const page of pages) {
+        const { images } = await page.node.Resources().lookup()
+
+        if (images) {
+          for (const [name, image] of Object.entries(images)) {
+            const imageData = await image.decode()
+            const compressedImage = await sharp(imageData).jpeg({ quality: 80, progressive: true }).toBuffer()
+
+            // Replace with compressed image
+            page.node.Resources().images[name] = pdfDoc.embedJpg(compressedImage)
+          }
+        }
+      }
+
       if (password) {
-        pdfDoc.encrypt({ userPassword: password, ownerPassword: password })
+        await pdfDoc.encrypt({ userPassword: password, ownerPassword: password })
       }
 
       if (!preserveMetadata) {
@@ -33,44 +75,35 @@ export async function POST(req: NextRequest) {
         pdfDoc.setCreator("")
       }
 
-      // Compress PDF
       const compressedPdf = await pdfDoc.save({
         useObjectStreams: true,
         addDefaultPage: false,
         preserveExistingEncryption: false,
       })
 
+      // Save to disk temporarily
+      const fileName = `${Date.now()}-${file.name}`
+      const filePath = join(process.cwd(), "tmp", fileName)
+      await writeFile(filePath, compressedPdf)
+
+      // Save to database
+      const fileDoc = await File.create({
+        originalName: file.name,
+        fileName,
+        size: file.size,
+        compressedSize: compressedPdf.length,
+        path: filePath,
+      })
+
       compressedFiles.push({
-        name: file.name.replace(".pdf", "_compressed.pdf"),
-        data: compressedPdf,
+        id: fileDoc._id,
+        name: file.name,
+        originalSize: file.size,
+        compressedSize: compressedPdf.length,
       })
     }
 
-    if (asZip && compressedFiles.length > 1) {
-      const zip = new JSZip()
-
-      compressedFiles.forEach((file) => {
-        zip.file(file.name, file.data)
-      })
-
-      const zipBuffer = await zip.generateAsync({ type: "uint8array" })
-
-      return new Response(zipBuffer, {
-        headers: {
-          "Content-Type": "application/zip",
-          "Content-Disposition": `attachment; filename="compressed_pdfs.zip"`,
-        },
-      })
-    } else {
-      // Return single file
-      const file = compressedFiles[0]
-      return new Response(file.data, {
-        headers: {
-          "Content-Type": "application/pdf",
-          "Content-Disposition": `attachment; filename="${file.name}"`,
-        },
-      })
-    }
+    return Response.json({ files: compressedFiles })
   } catch (error) {
     console.error("Compression error:", error)
     return Response.json({ error: "Failed to compress PDF" }, { status: 500 })
